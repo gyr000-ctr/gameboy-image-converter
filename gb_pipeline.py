@@ -8,8 +8,10 @@ breakdown these functions implement.
 """
 
 import heapq
+import struct
 import threading
-from dataclasses import dataclass, replace
+import zlib
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from PIL import Image
@@ -1327,6 +1329,512 @@ class ConversionResult:
                                   # n_merges, p95_delta_e, preset, dither
     warnings: list                # list[str]
     palette_hex: list             # per palette, 4 hex strings
+    # Tile-mirror mapping for map-editor tile reuse (None when the conversion
+    # was asked not to carry one). Equal mappings compare equal, so results
+    # remain comparable field-for-field.
+    tile_mapping: "TileMapping | None" = field(default=None, compare=False)
+
+
+# ---------------------------------------------------------------------------
+# Tile-mirror mapping (map-editor tile reuse)
+# ---------------------------------------------------------------------------
+#
+# A map editor wants to store every 8x8 tile once and reference it in up to
+# four orientations. ``TileMapping`` is that reusable contract, modelled on the
+# CGB background attribute map: each cell names a stored tile index plus
+# independent horizontal / vertical mirror bits, and the stored tiles hold
+# palette-independent 2-bit index patterns. ``build_tile_mapping`` derives it
+# from a GBImage by re-canonicalizing the rendered cell content (so the map is
+# the smallest legal one regardless of how ``dedup_patterns`` happened to mint
+# the stored patterns); ``rebuild_from_mapping`` reconstructs the image from a
+# mapping alone; ``unmirrored_size_bytes`` is the same payload with every
+# mirror bit forced off, for a size comparison.
+#
+# Serialized form (``to_bytes`` / ``from_bytes``), all integers big-endian
+# except the tile bytes, which are GB-native 2bpp:
+#
+#   offset  bytes  field
+#   0       4      magic b"GBTM"
+#   4       1      version (2)
+#   5       1      flags: bit0 = mapping carries mirror bits,
+#                         bit1 = sequential storage (one stored tile per cell)
+#   6       2      n_tiles    (uint16) -- stored tiles
+#   8       2      tile_cols  (uint16) -- tilemap width in cells
+#   10      2      tile_rows  (uint16) -- tilemap height in cells
+#   12      2      n_palettes (uint16)
+#   14      4      tiles_len  (uint32) -- bytes in the tile-pixel block
+#                  = n_tiles * 16
+#   18      ...    stored tile pixels: per tile, 16 bytes of GB-native 2bpp
+#                  (identical to GB Studio's tileData hash input)
+#   ...     4*p    palettes: per palette, 4 RGB triplets (12 bytes)
+#   ...     3*n    per-cell references, raster order, 3 bytes each:
+#                  uint16 tile index, then one byte (hflip << 1) | vflip
+#   ...     n      per-cell palette ids, raster order: one byte per cell
+#   ...     4      crc32 (uint32) over every byte before it
+#
+# Any mutation of the bytes -- including one that leaves the CRC field itself
+# untouched -- makes ``from_bytes`` raise ``TileMappingError`` with an
+# actionable message. Truncated payloads, dangling tile or palette references,
+# and a cell grid that disagrees with the tilemap size are rejected the same
+# way, all before any caller can index into a half-parsed mapping.
+
+_TILE_MAPPING_MAGIC = b"GBTM"
+_TILE_MAPPING_VERSION = 2
+_TILE_MAPPING_FLAG_MIRRORS = 0x01
+_TILE_MAPPING_FLAG_SEQUENTIAL = 0x02
+# magic, version, flags, n_tiles, tile_cols, tile_rows, n_palettes, tiles_len
+_TILE_MAPPING_HEADER = struct.Struct(">4sBBHHHHI")
+_TILE_MAPPING_CRC = struct.Struct(">I")
+_TILE_MAPPING_REF = struct.Struct(">HB")
+_MAX_AXIS = 0xFFFF
+_MAX_TILES = 0xFFFF
+
+
+class TileMappingError(ValueError):
+    """Raised when a serialized tile-mirror mapping is malformed or corrupt."""
+
+
+@dataclass
+class TileMapping:
+    """Tile reuse map: stored tiles + one orientation reference per cell.
+
+    The stored ``tiles`` are palette-independent index patterns (values 0-3)
+    in a *canonical* orientation; each cell carries independent ``hflip`` /
+    ``vflip`` bits applied on placement::
+
+        placed = tiles[tilemap[row, col]]
+        if hflip[row, col]: placed = np.fliplr(placed)
+        if vflip[row, col]: placed = np.flipud(placed)
+
+    ``attrs_palette`` is the CGB attribute-map palette id per cell, kept so a
+    map editor can rebuild the exact colored image; it does not affect which
+    tile is stored (tile identity is the 2bpp pattern). Varying only the
+    mirror bits never changes a stored tile's pixels.
+    """
+
+    tiles: np.ndarray       # (n, 8, 8) uint8 values 0-3 (canonical set)
+    tilemap: np.ndarray     # (th, tw) int32 stored-tile index per cell
+    hflip: np.ndarray       # (th, tw) bool
+    vflip: np.ndarray       # (th, tw) bool
+    attrs_palette: np.ndarray  # (th, tw) uint8 palette id per cell
+    palettes: np.ndarray    # (p, 4, 3) uint8 RGB for reconstruction
+
+    def __post_init__(self):
+        tiles = np.asarray(self.tiles)
+        if tiles.ndim != 3 or tiles.shape[1:] != (8, 8) or tiles.dtype != np.uint8:
+            raise TileMappingError(
+                f"tiles must be a uint8 (n, 8, 8) array; got "
+                f"{tiles.dtype} {tiles.shape}"
+            )
+        if tiles.shape[0] > _MAX_TILES:
+            raise TileMappingError(
+                f"{tiles.shape[0]} stored tiles exceeds the 16-bit limit "
+                f"({_MAX_TILES})"
+            )
+        if tiles.size and int(tiles.max()) > 3:
+            raise TileMappingError("tile pattern values must be in 0-3")
+        tilemap = np.asarray(self.tilemap)
+        if tilemap.ndim != 2:
+            raise TileMappingError(f"tilemap must be 2-D; got {tilemap.shape}")
+        th, tw = tilemap.shape
+        if th > _MAX_AXIS or tw > _MAX_AXIS:
+            raise TileMappingError(
+                f"tilemap {tw}x{th} exceeds the 16-bit axis limit ({_MAX_AXIS})"
+            )
+        if tilemap.size and not tiles.shape[0]:
+            raise TileMappingError("tilemap references tiles but none are stored")
+        if tilemap.size and (
+            int(tilemap.min()) < 0 or int(tilemap.max()) >= tiles.shape[0]
+        ):
+            raise TileMappingError(
+                f"tilemap references a tile outside 0..{tiles.shape[0] - 1}"
+            )
+        hflip = np.asarray(self.hflip)
+        vflip = np.asarray(self.vflip)
+        if hflip.shape != (th, tw) or vflip.shape != (th, tw):
+            raise TileMappingError(
+                f"hflip/vflip must be {(th, tw)}; got {hflip.shape} and "
+                f"{vflip.shape}"
+            )
+        attrs_palette = np.asarray(self.attrs_palette)
+        if attrs_palette.shape != (th, tw):
+            raise TileMappingError(
+                f"attrs_palette must be {(th, tw)}; got {attrs_palette.shape}"
+            )
+        palettes = np.asarray(self.palettes)
+        if palettes.ndim != 3 or palettes.shape[1:] != (4, 3):
+            raise TileMappingError(
+                f"palettes must be (p, 4, 3); got {palettes.shape}"
+            )
+        if attrs_palette.size and int(attrs_palette.max()) >= palettes.shape[0]:
+            raise TileMappingError(
+                f"attrs_palette references palette {int(attrs_palette.max())} "
+                f"but only {palettes.shape[0]} are stored"
+            )
+        # Normalize to the exact dtypes the decoder produces, so an in-memory
+        # mapping and a byte round-trip compare equal field-for-field.
+        self.tiles = np.ascontiguousarray(tiles, dtype=np.uint8)
+        self.tilemap = np.ascontiguousarray(tilemap, dtype=np.int32)
+        self.hflip = np.ascontiguousarray(hflip, dtype=bool)
+        self.vflip = np.ascontiguousarray(vflip, dtype=bool)
+        self.attrs_palette = np.ascontiguousarray(attrs_palette, dtype=np.uint8)
+        self.palettes = np.ascontiguousarray(palettes, dtype=np.uint8)
+
+    @property
+    def shape(self) -> tuple:
+        """``(tile_rows, tile_cols)`` of the cell grid."""
+        return tuple(self.tilemap.shape)
+
+    @property
+    def n_tiles(self) -> int:
+        return int(self.tiles.shape[0])
+
+    @property
+    def n_cells(self) -> int:
+        return int(self.tilemap.size)
+
+    @property
+    def n_mirrored_cells(self) -> int:
+        return int(np.count_nonzero(self.hflip | self.vflip))
+
+    def to_bytes(self) -> bytes:
+        """Serialize the mapping (layout documented above the section)."""
+        th, tw = self.tilemap.shape
+        n = self.n_tiles
+        flags = _TILE_MAPPING_FLAG_MIRRORS
+        if n == self.n_cells:
+            flags |= _TILE_MAPPING_FLAG_SEQUENTIAL
+        stored = _tileset_to_2bpp(self.tiles)
+        palette_bytes = np.asarray(self.palettes, dtype=np.uint8).tobytes()
+        header = _TILE_MAPPING_HEADER.pack(
+            _TILE_MAPPING_MAGIC,
+            _TILE_MAPPING_VERSION,
+            flags,
+            n,
+            tw,
+            th,
+            int(self.palettes.shape[0]),
+            len(stored),
+        )
+        refs = b"".join(
+            _TILE_MAPPING_REF.pack(int(self.tilemap[tr, tc]),
+                                   (int(self.hflip[tr, tc]) << 1)
+                                   | int(self.vflip[tr, tc]))
+            for tr in range(th)
+            for tc in range(tw)
+        )
+        body = (header + stored + palette_bytes + refs
+                + np.asarray(self.attrs_palette, dtype=np.uint8).tobytes())
+        return body + _TILE_MAPPING_CRC.pack(zlib.crc32(body) & 0xFFFFFFFF)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TileMapping":
+        """Parse and validate a serialized mapping.
+
+        Raises ``TileMappingError`` for anything that is not a complete,
+        CRC-valid mapping -- the failure mode the map-editor importer must
+        surface instead of loading garbage.
+        """
+        try:
+            buf = bytes(data)
+        except TypeError:
+            raise TileMappingError(
+                f"mapping payload must be bytes-like; got {type(data).__name__}"
+            ) from None
+        hsize = _TILE_MAPPING_HEADER.size
+        floor = hsize + _TILE_MAPPING_CRC.size
+        if len(buf) < floor:
+            raise TileMappingError(
+                f"truncated mapping header: {len(buf)} bytes, need at least "
+                f"{floor}"
+            )
+        (magic, version, flags, n_tiles, tw, th, n_palettes,
+         tiles_len) = _TILE_MAPPING_HEADER.unpack(buf[:hsize])
+        if magic != _TILE_MAPPING_MAGIC:
+            raise TileMappingError(
+                f"bad mapping magic {magic!r}; expected {_TILE_MAPPING_MAGIC!r}"
+            )
+        if version != _TILE_MAPPING_VERSION:
+            raise TileMappingError(
+                f"unsupported mapping version {version}; expected "
+                f"{_TILE_MAPPING_VERSION}"
+            )
+        if flags & ~(_TILE_MAPPING_FLAG_MIRRORS | _TILE_MAPPING_FLAG_SEQUENTIAL):
+            raise TileMappingError(f"unknown mapping flags 0x{flags:02x}")
+        if th == 0 or tw == 0:
+            raise TileMappingError(f"mapping has an empty {tw}x{th} cell grid")
+        if n_tiles == 0:
+            raise TileMappingError("mapping declares zero stored tiles")
+        if n_palettes < 1:
+            raise TileMappingError(f"mapping declares {n_palettes} palettes")
+        if tiles_len != n_tiles * 16:
+            raise TileMappingError(
+                f"tiles_len field {tiles_len} disagrees with {n_tiles} tiles "
+                f"({n_tiles * 16} bytes)"
+            )
+        n_cells = th * tw
+        palette_len = n_palettes * 12
+        expected = (hsize + tiles_len + palette_len
+                    + n_cells * _TILE_MAPPING_REF.size + n_cells
+                    + _TILE_MAPPING_CRC.size)
+        if len(buf) != expected:
+            raise TileMappingError(
+                f"mapping is {len(buf)} bytes; header and grid require "
+                f"{expected} (truncated or trailing data)"
+            )
+        body = buf[: len(buf) - _TILE_MAPPING_CRC.size]
+        (want_crc,) = _TILE_MAPPING_CRC.unpack(buf[len(buf) - _TILE_MAPPING_CRC.size :])
+        got_crc = zlib.crc32(body) & 0xFFFFFFFF
+        if got_crc != want_crc:
+            raise TileMappingError(
+                f"mapping checksum mismatch (stored 0x{want_crc:08x}, computed "
+                f"0x{got_crc:08x}): the file is corrupt"
+            )
+        tiles = _tileset_from_2bpp(body[hsize : hsize + tiles_len], n_tiles)
+        pbase = hsize + tiles_len
+        palettes = np.frombuffer(
+            body[pbase : pbase + palette_len], dtype=np.uint8
+        ).reshape(n_palettes, 4, 3).copy()
+        refs_at = pbase + palette_len
+        tilemap = np.zeros((th, tw), dtype=np.int32)
+        hflip = np.zeros((th, tw), dtype=bool)
+        vflip = np.zeros((th, tw), dtype=bool)
+        base = refs_at
+        for cell in range(n_cells):
+            idx, bits = _TILE_MAPPING_REF.unpack_from(
+                body, base + cell * _TILE_MAPPING_REF.size
+            )
+            if idx >= n_tiles:
+                raise TileMappingError(
+                    f"cell {cell} references tile {idx}, but only {n_tiles} "
+                    "tiles are stored"
+                )
+            if bits & ~0b11:
+                raise TileMappingError(
+                    f"cell {cell} has unknown flip bits 0x{bits:02x}"
+                )
+            tr, tc = divmod(cell, tw)
+            tilemap[tr, tc] = idx
+            hflip[tr, tc] = bool(bits & 0b10)
+            vflip[tr, tc] = bool(bits & 0b01)
+        attr_base = base + n_cells * _TILE_MAPPING_REF.size
+        attrs_palette = np.frombuffer(
+            body[attr_base : attr_base + n_cells], dtype=np.uint8
+        ).reshape(th, tw).copy()
+        if attrs_palette.size and int(attrs_palette.max()) >= n_palettes:
+            raise TileMappingError(
+                f"a cell references palette {int(attrs_palette.max())}, but "
+                f"only {n_palettes} are stored"
+            )
+        return cls(
+            tiles=tiles,
+            tilemap=tilemap,
+            hflip=hflip,
+            vflip=vflip,
+            attrs_palette=attrs_palette,
+            palettes=palettes,
+        )
+
+
+def _tileset_to_2bpp(tiles: np.ndarray) -> bytes:
+    """Encode (n, 8, 8) 0-3 patterns as GB-native 2bpp (16 bytes per tile)."""
+    tiles = np.asarray(tiles, dtype=np.uint8)
+    return b"".join(pattern_to_2bpp(tiles[i]) for i in range(tiles.shape[0]))
+
+
+def _tileset_from_2bpp(raw: bytes, n_tiles: int) -> np.ndarray:
+    """Decode ``n_tiles`` * 16 bytes of GB 2bpp into an (n, 8, 8) tileset."""
+    if len(raw) != n_tiles * 16:
+        raise TileMappingError(
+            f"tile block is {len(raw)} bytes; {n_tiles} tiles need "
+            f"{n_tiles * 16}"
+        )
+    out = np.zeros((n_tiles, 8, 8), dtype=np.uint8)
+    for i in range(n_tiles):
+        chunk = raw[i * 16 : (i + 1) * 16]
+        for row in range(8):
+            low, high = chunk[row * 2], chunk[row * 2 + 1]
+            for col in range(8):
+                bit = 7 - col
+                out[i, row, col] = (((high >> bit) & 1) << 1) | ((low >> bit) & 1)
+    return out
+
+
+def build_tile_mapping(gb: GBImage, allow_flips: bool = True) -> TileMapping:
+    """Canonicalize ``gb``'s tileset into a tile-reuse mapping.
+
+    Re-derives the smallest legal tileset *from the rendered cell content*
+    instead of trusting ``gb.patterns`` as stored: each cell's effective
+    pattern (stored pattern with the cell's own flip bits applied) is looked
+    up against every stored tile in all four orientations. On a hit the cell
+    reuses that tile with the matching mirror bits; on a miss the effective
+    pattern becomes a new canonical stored tile. Idempotent and
+    orientation-independent: a tile seen only mirrored is stored once.
+    ``allow_flips=False`` never sets mirror bits, so mirrored cells need
+    their own stored copy.
+    """
+    th, tw = gb.tilemap.shape
+    tilemap = np.zeros((th, tw), dtype=np.int32)
+    hflip = np.zeros((th, tw), dtype=bool)
+    vflip = np.zeros((th, tw), dtype=bool)
+    stored: list = []
+    lookup: dict = {}  # 2bpp bytes -> (stored index, hflip, vflip)
+
+    for tr in range(th):
+        for tc in range(tw):
+            effective = gb.patterns[int(gb.tilemap[tr, tc])]
+            if gb.attrs_hflip[tr, tc]:
+                effective = np.fliplr(effective)
+            if gb.attrs_vflip[tr, tc]:
+                effective = np.flipud(effective)
+            key = pattern_to_2bpp(effective)
+            hit = lookup.get(key)
+            if hit is not None:
+                out_idx, fh, fv = hit
+            else:
+                out_idx = len(stored)
+                stored.append(np.ascontiguousarray(effective))
+                fh = fv = False
+                orient = pattern_variants(effective) if allow_flips else {"": effective}
+                # First registration for a key wins; a self-symmetric tile
+                # simply maps several of its orientations onto itself.
+                for name, variant in orient.items():
+                    lookup.setdefault(
+                        pattern_to_2bpp(variant),
+                        (out_idx, "h" in name, "v" in name),
+                    )
+            tilemap[tr, tc] = out_idx
+            hflip[tr, tc] = fh
+            vflip[tr, tc] = fv
+
+    tiles = np.stack(stored) if stored else np.zeros((0, 8, 8), dtype=np.uint8)
+    return TileMapping(
+        tiles=tiles,
+        tilemap=tilemap,
+        hflip=hflip,
+        vflip=vflip,
+        attrs_palette=np.asarray(gb.attrs_palette, dtype=np.uint8).copy(),
+        palettes=np.asarray(gb.palettes, dtype=np.uint8).copy(),
+    )
+
+
+def apply_tile_mapping(mapping: TileMapping) -> np.ndarray:
+    """Expand a mapping into an (th*8, tw*8) index grid (values 0-3)."""
+    tiles = np.asarray(mapping.tiles, dtype=np.uint8)
+    th, tw = mapping.tilemap.shape
+    out = np.zeros((th * 8, tw * 8), dtype=np.uint8)
+    for tr in range(th):
+        for tc in range(tw):
+            tile = tiles[int(mapping.tilemap[tr, tc])]
+            if mapping.hflip[tr, tc]:
+                tile = np.fliplr(tile)
+            if mapping.vflip[tr, tc]:
+                tile = np.flipud(tile)
+            out[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8] = tile
+    return out
+
+
+def rebuild_from_mapping(mapping: TileMapping) -> Image.Image:
+    """Rebuild the RGB image using only the stored tiles, the per-cell tile
+    index + mirror bits, and the per-cell palette id. This is the map-editor
+    reconstruction path; it never consults the original GBImage."""
+    index = apply_tile_mapping(mapping)
+    palettes = np.asarray(mapping.palettes, dtype=np.uint8)
+    th, tw = mapping.tilemap.shape
+    out = np.zeros((th * 8, tw * 8, 3), dtype=np.uint8)
+    for tr in range(th):
+        for tc in range(tw):
+            pal = palettes[int(mapping.attrs_palette[tr, tc])]
+            out[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8] = pal[
+                index[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+            ]
+    return Image.fromarray(out, "RGB")
+
+
+def mapping_size_bytes(mapping: TileMapping) -> int:
+    """Serialized size of ``mapping`` exactly as ``to_bytes`` emits it."""
+    return len(mapping.to_bytes())
+
+
+def unmirrored_size_bytes(mapping: TileMapping) -> int:
+    """Serialized size of the same content with every mirror bit forced off.
+
+    Models a map editor that cannot flip: each mirrored cell must store its
+    own copy of its effective pattern. Everything else (cell grid, palettes)
+    is identical, so the difference is exactly the bytes mirroring saves.
+    """
+    index = apply_tile_mapping(mapping)
+    th, tw = mapping.tilemap.shape
+    tiles = np.zeros((th * tw, 8, 8), dtype=np.uint8)
+    for tr in range(th):
+        for tc in range(tw):
+            tiles[tr * tw + tc] = index[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+    plain = TileMapping(
+        tiles=tiles,
+        tilemap=np.arange(th * tw, dtype=np.int32).reshape(th, tw),
+        hflip=np.zeros((th, tw), dtype=bool),
+        vflip=np.zeros((th, tw), dtype=bool),
+        attrs_palette=mapping.attrs_palette.copy(),
+        palettes=mapping.palettes.copy(),
+    )
+    return len(plain.to_bytes())
+
+
+def mapping_matches_image(mapping: TileMapping, image) -> bool:
+    """True iff ``rebuild_from_mapping(mapping)`` is pixel-identical to
+    ``image`` (a PIL image or an (H, W, 3) array)."""
+    arr = np.asarray(image, dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    return bool(np.array_equal(np.asarray(rebuild_from_mapping(mapping)), arr))
+
+
+def remap_mapping_palettes(mapping: TileMapping, image) -> TileMapping:
+    """Retarget each cell's palette id so the mapping reproduces ``image``.
+
+    Used when the shipped PNG diverges from the mapping's GBImage (GB Studio
+    palette-conform recoloring). For each cell the placed pattern is matched
+    against every stored palette; the palette id that reproduces the cell's
+    pixels exactly is chosen (lowest id on a tie). Tile identity and mirror
+    bits never change. Cells with no exact palette match keep their id and
+    simply contribute a per-cell colour difference -- the mapping remains a
+    valid tile-reuse map either way.
+    """
+    arr = np.asarray(image, dtype=np.uint8)
+    index = apply_tile_mapping(mapping)
+    palettes = np.asarray(mapping.palettes, dtype=np.uint8)
+    th, tw = mapping.tilemap.shape
+    attrs = mapping.attrs_palette.copy()
+    for tr in range(th):
+        for tc in range(tw):
+            block = arr[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+            sub = index[tr * 8 : tr * 8 + 8, tc * 8 : tc * 8 + 8]
+            for pid in range(palettes.shape[0]):
+                if np.array_equal(palettes[pid][sub], block):
+                    attrs[tr, tc] = pid
+                    break
+    return TileMapping(
+        tiles=mapping.tiles,
+        tilemap=mapping.tilemap,
+        hflip=mapping.hflip,
+        vflip=mapping.vflip,
+        attrs_palette=attrs,
+        palettes=palettes,
+    )
+
+
+def mapping_from_conversion(result: ConversionResult) -> TileMapping:
+    """The mapping attached to a ``ConversionResult``.
+
+    Raises ``TileMappingError`` when the conversion ran with mapping disabled,
+    so callers get a clear error instead of a ``None`` blowing up later.
+    """
+    if result.tile_mapping is None:
+        raise TileMappingError(
+            "this conversion did not carry a tile mapping; call "
+            "convert_for_hardware(..., carry_tile_mapping=True)"
+        )
+    return result.tile_mapping
 
 
 def _pixel_luminance(rgb: np.ndarray) -> np.ndarray:
@@ -1659,6 +2167,7 @@ def convert_for_hardware(
     custom_palette: np.ndarray | None = None,
     mono_ramp: np.ndarray | None = None,
     max_colors: int | None = None,
+    carry_tile_mapping: bool = True,
 ) -> ConversionResult:
     """Convert ``image`` to a GB Studio-importable render for a named preset.
 
@@ -1843,6 +2352,32 @@ def convert_for_hardware(
         "dither": dither,
     }
 
+    # Tile-mirror mapping (map-editor tile reuse): the final tileset plus the
+    # per-cell (tile index, hflip, vflip) map, derived from the same GBImage
+    # the final render came from. Building it never mutates that GBImage, so
+    # the shipped image is byte-identical whether or not it is requested.
+    tile_mapping = None
+    if carry_tile_mapping:
+        tile_mapping = build_tile_mapping(final_gb, allow_flips=ps.allow_flips)
+        stats["mapping_tiles"] = tile_mapping.n_tiles
+        stats["mapping_cells"] = tile_mapping.n_cells
+        stats["mapping_mirrored_cells"] = tile_mapping.n_mirrored_cells
+
+        # The shipped PNG is the GB-Studio-conformed render, which may have
+        # recolored overflow tiles (cr.n_recolored). Pixel colours are the
+        # map editor's business, not tile identity, so when that happens
+        # retarget each cell's palette id to whichever stored palette
+        # reproduces its shipped pixels exactly. Tile identity and mirror
+        # bits are untouched; only attrs_palette moves.
+        if not mapping_matches_image(tile_mapping, final_img):
+            tile_mapping = remap_mapping_palettes(tile_mapping, final_img)
+            if not mapping_matches_image(tile_mapping, final_img):
+                warnings.append(
+                    "Tile mapping could not reproduce the shipped PNG exactly "
+                    "after GB Studio palette conform recolored tiles; tile "
+                    "reuse is unaffected but some cell colours differ."
+                )
+
     if ps.mono:
         # A custom mono ramp whose shades share a GB Studio green bucket would
         # silently merge on import (its fixed 65/130/205 thresholds ignore our
@@ -1879,4 +2414,5 @@ def convert_for_hardware(
         stats=stats,
         warnings=warnings,
         palette_hex=_palette_hex(final_gb.palettes),
+        tile_mapping=tile_mapping,
     )
